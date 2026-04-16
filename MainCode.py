@@ -14,7 +14,8 @@ import base64  # Python base64 data encodings
 import email.mime.text  # Python Multipurpose Internet Mail Extensions (MIME)
 import netifaces  # Python module to find device IP address
 import random  # Python random number module
-import RPi.GPIO as GPIO  # Python RPi GPIO utility
+import gpiod  # Python gpiod GPIO utility (Pi 5 compatible)
+from gpiod.line_settings import LineSettings, Direction, Value
 import re  # Python regular expression module
 import signal  # Python signal module [e.g., exit signal]
 from PIL import Image, ImageDraw, ImageFont  # Python Image module [change background]
@@ -630,21 +631,42 @@ def changeOutputFileN(D, FN, Dic):
     return [D, FN]
 
 
+_gpio_request = None  # module-level gpiod line request for cleanup
+
+
 def setupGPIO(userConfig):
     """
-    Function to setup GPIO.
+    Function to setup GPIO using gpiod (Pi 5 compatible).
     """
+
+    global _gpio_request
 
     # Keep Teensy Reset & Program pins HIGH
     if "GPIO_Pin_Type" in userConfig:
-        print("   ... Writing GPIO.HIGH to Teensy reset and program pins")
+        print("   ... Writing HIGH to Teensy reset and program pins")
         teensyProgPin = int(userConfig["Program_Pin"])
-        if userConfig["GPIO_Pin_Type"].lower() == "bcm":
-            GPIO.setmode(GPIO.BCM)
-        elif userConfig["GPIO_Pin_Type"].lower() == "board":
-            GPIO.setmode(GPIO.BOARD)
-        GPIO.setup(teensyProgPin, GPIO.OUT)
-        GPIO.output(teensyProgPin, GPIO.HIGH)
+        _gpio_request = gpiod.request_lines(
+            "/dev/gpiochip4",
+            consumer="maincode-gpio",
+            config={
+                teensyProgPin: LineSettings(
+                    direction=Direction.OUTPUT,
+                    output_value=Value.ACTIVE,
+                ),
+            },
+        )
+
+
+def cleanupGPIO():
+    """Release gpiod resources."""
+
+    global _gpio_request
+    if _gpio_request is not None:
+        try:
+            _gpio_request.release()
+        except Exception:
+            pass
+        _gpio_request = None
 
 
 def includeSMHeader(srcF, destF):
@@ -1268,7 +1290,7 @@ def main():
     ser.close()
     if analogEnabled:
         anSer.close()
-    GPIO.cleanup()
+    cleanupGPIO()
 
     # Trigger transfer/backup pipeline after every run
 

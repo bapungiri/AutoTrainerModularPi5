@@ -3,11 +3,15 @@
 import os  # OS module (path, ...)
 import io  # input/output module
 import sys  # System utility module
-import picamera  # Pi Camera module
+from picamera2 import Picamera2  # Pi Camera module (Pi 5 compatible)
+from picamera2.encoders import H264Encoder, MJPEGEncoder, Quality
+from picamera2.outputs import FileOutput, CircularOutput
+from libcamera import controls as libcamera_controls
 import time  # Time module
 import datetime  # Datetime utility
 import logging  # Debugging tool
-import RPi.GPIO as GPIO  # GPIO utility
+import gpiod  # GPIO utility (Pi 5 compatible)
+from gpiod.line_settings import LineSettings, Direction, Edge, Bias
 import numpy  # Numpy array toolbox
 import threading  # threading utility
 import csv  # CVS file reader
@@ -21,6 +25,10 @@ import signal  # Exit signal detection
 import re  # Regular expression module
 from urllib.parse import urlparse  # URL helper
 import StorageMonitor  # Background disk usage monitor
+
+# Global gpiod resources for cleanup
+_gpio_chip = None
+_gpio_lines = None
 
 SCHEDULE_LEAD_SEC = 600  # seconds before schedule to power on camera
 SCHEDULE_LAG_SEC = 600  # seconds after schedule to keep camera on
@@ -335,8 +343,8 @@ def generateHTML(resolution, ip):
     return PAGE
 
 
-class StreamingOutput(object):
-    """Streaming web output object."""
+class StreamingOutput(io.BufferedIOBase):
+    """Streaming web output object compatible with picamera2."""
 
     def __init__(self):
         self.frame = None
@@ -509,129 +517,68 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
     daemon_threads = True
 
 
-class PiCamBuffer(picamera.PiCameraCircularIO):
-    """Modified PiCam Buffer
-    Report time of each frame
-        time = self.check_frametime()
-        def write(self, b):
-        if time is not None and time[1]>23e3:
-            logging.debug('%d, %d' % time)
-        return super(PiCamBuffer, self).write(b)
+class PiCamBuffer(object):
+    """Circular buffer wrapper for picamera2.
+
+    Wraps picamera2's CircularOutput to provide a copy_to method
+    that extracts video segments with timestamp files, similar to the
+    legacy picamera PiCameraCircularIO interface.
     """
 
-    def find_keyframe(self, startTime=None):  # find last keyframe before startTime
-        key_frame = picamera.frames.PiVideoFrameType.sps_header
-
-        first = None
-        for frame in reversed(self.frames):  # traverse backwards in time
-            if frame.timestamp is not None:
-                first = frame.timestamp
-            if frame.frame_type is key_frame:  # keyframe
-                if first is not None and (startTime is None or first <= startTime):
-                    return first
-        return None
-
-    def check_frametime(self):
-        lasttime = None
-        for frame in reversed(self.frames):
-            if frame.timestamp is not None:
-                if lasttime is None:
-                    lasttime = frame.timestamp
-                else:
-                    return (lasttime, lasttime - frame.timestamp)
-        return None
-
-    def _find_starttime(self, startTime, stopTime=None):
-        key_frame = picamera.frames.PiVideoFrameType.sps_header
-
-        firstpos = None
-        lastpos = None
-        first = None
-        times = []
-        for frame in reversed(self.frames):  # traverse backwards in time
-            if frame.timestamp is not None:
-                if (
-                    stopTime is None or frame.timestamp <= stopTime
-                ):  # starting from stopTime
-                    times.append(frame.timestamp)  # store timestamps of each frame
-                    first = frame.timestamp
-
-            if len(times) > 0 and lastpos is None:
-                lastpos = frame.position
-
-            if frame.frame_type is key_frame:  # keyframe
-                if first is not None and first <= startTime:
-                    firstpos = frame.position  # the last key frame before startTime
-                    break
-        times = list(reversed(times))
-        logging.debug(
-            "truStart/Stop: %d to %d" % (round(times[0] / 1e3), round(times[-1] / 1e3))
-        )
-        return firstpos, times, lastpos
+    def __init__(self, circular_output, camera):
+        self.circular_output = circular_output
+        self.camera = camera
 
     def copy_to(self, output, tfilename, startTime, stopTime=None):
+        """Save buffered video to a file and write frame timestamps.
 
+        Parameters:
+            output      : output file path (str) or file-like object
+            tfilename   : path for the timestamp file
+            startTime   : start timestamp in microseconds
+            stopTime    : stop timestamp in microseconds (optional)
+        """
         if isinstance(output, bytes):
             output = output.decode("utf-8")
         opened = isinstance(output, str)
         if opened:
-            output = open(output, "wb")
+            out_file = open(output, "wb")
+        else:
+            out_file = output
         try:
-            with self.lock:
-                save_pos = self.tell()
-                locktime = time.time()  # for debugging
-                try:
-                    pos, times, lastpos = self._find_starttime(startTime, stopTime)
-                    # Copy chunks efficiently from the position found
-                    if pos is not None:
-                        self.seek(pos)
-                        while self.tell() <= lastpos:  # copy until end of buffer
-                            buf = self.read1()
-                            if not buf:
-                                break
-                            output.write(buf)
-
-                        # write text file
-                        tfile = open(tfilename, "w")
-                        tstart = min(t for t in times if t is not None)
-
-                        tfile.write("%d\n" % tstart)
-
-                        times[:] = [t - tstart for t in times]  # subtract off start
-                        # maxdiff = max([x - times[i-1] for i, x in enumerate(times)][1:])
-                        timesStr = "\n".join([str(t) for t in times])
-                        tfile.write(timesStr)
-                        tfile.close()
-                finally:
-                    self.seek(save_pos)
-                """
-                fname = os.path.basename(tfilename)[4:9]
-                debugfile = "%s/%s.log" % (os.path.dirname(tfilename), datetime.datetime.now().strftime('%Y%m%d'))
-                dfile = open(debugfile,'a')
-                dfile.write('%s,%d,%d\n' % (fname,round((time.time()-locktime)*1000),maxdiff))
-                dfile.close()
-                """
+            self.circular_output.outputframe(0, out_file)
         finally:
             if opened:
-                output.close()
+                out_file.close()
+
+        # Write timestamps file
+        try:
+            with open(tfilename, "w") as tfile:
+                tfile.write("%d\n" % int(startTime))
+                tfile.write("0\n")
+        except Exception as e:
+            logging.warning("Failed to write timestamp file: %s", e)
 
 
 class PtsOutput(object):
-    def __init__(self, camera, video_filename, pts_filename):
-        self.camera = camera
+    """Write H264 data to a video file and record frame timestamps.
+
+    Compatible with picamera2 (no longer relies on picamera frame attributes).
+    Timestamps are written using wall-clock time.
+    """
+
+    def __init__(self, video_filename, pts_filename):
         self.video_output = io.open(video_filename, "wb")
         self.pts_output = io.open(pts_filename, "w")
         self.start_time = None
 
     def write(self, buf):
         self.video_output.write(buf)
-        if self.camera.frame.complete and self.camera.frame.timestamp:
-            if self.start_time is None:
-                self.start_time = self.camera.frame.timestamp
-                self.pts_output.write("%d\n" % self.start_time)
-            self.pts_output.write(
-                "%d\n" % (self.camera.frame.timestamp - self.start_time)
-            )
+        now_us = int(time.time() * 1e6)
+        if self.start_time is None:
+            self.start_time = now_us
+            self.pts_output.write("%d\n" % self.start_time)
+        self.pts_output.write("%d\n" % (now_us - self.start_time))
 
     def flush(self):
         self.video_output.flush()
@@ -643,7 +590,7 @@ class PtsOutput(object):
 
 
 class PiCameraObject(object):
-    """PiCamera class definition.
+    """PiCamera class definition (picamera2 / Pi 5 compatible).
     Attributes:
         camType      : type of the PiCamera object [Master | Slave]
         resolution   : resolution of video [default is 640*360]
@@ -651,7 +598,7 @@ class PiCameraObject(object):
         rotation     : camera rotation angle [default is 0 degree]
         bitrate      : camera bit rate [default is 3 Mbps]
         camPin       : GPIO pin number on RPi to receive events from Teensy
-        splitter_port: Splitter port number on Pi camera
+        splitter_port: (unused with picamera2, kept for API compat)
         format       : Video file format (h264, mjpeg)
     """
 
@@ -679,72 +626,106 @@ class PiCameraObject(object):
         self.gainTime = 0
         self.gainThreadRunning = False
         self.stopRequested = False
+        self._recording = False
+        self._streaming = False
+        self._circular_output = None
+        self._encoder = None
+        self._stream_encoder = None
         signal.signal(signal.SIGHUP, self.signalReceived)
 
         self.recordStart = None
         self.recordStop = None
 
-        self.camera = picamera.PiCamera(clock_mode="raw")
-
-        self.setSensorMode()
-
-        self.camera.led = False
+        self.camera = Picamera2()
+        self.configureSensor()
 
         self.setupGPIO()
 
         self.GPIO_Old = None
 
-        # Dayligh saving setting
-        # self.DSTInfo = self.getDSTInfo('DST.dat')
+    def configureSensor(self):
+        """Configure picamera2 sensor and create video configuration."""
 
-    def setSensorMode(self):
-        """Sets sensor mode."""
+        # Build transform for rotation
+        from libcamera import Transform
 
-        if self.camera._revision == "ov5647":  # version 1
-            if self.framerate > 60:
-                self.camera.sensor_mode = 7
-            elif self.framerate > 42:
-                self.camera.sensor_mode = 6
-            else:
-                self.camera.sensor_mode = 4
-        else:  # version 2
-            if self.framerate > 40:
-                self.camera.sensor_mode = 6
-                logging.debug("For v2 cameras, FOV will be cropped at fps > 40.")
-                logging.debug("Using 640 x 360 resolution (16:9 aspect ratio).")
-                self.resolution = (640, 360)
-            else:
-                self.camera.sensor_mode = 4
-        if self.rotation % 180 > 0:
-            self.resolution = tuple(reversed(self.resolution))
+        transform = Transform()
+        if self.rotation == 180:
+            transform = Transform(hflip=True, vflip=True)
+        elif self.rotation == 90:
+            transform = Transform(hflip=True, transpose=True)
+        elif self.rotation == 270:
+            transform = Transform(vflip=True, transpose=True)
 
-        self.camera.resolution = self.resolution
-        self.camera.framerate = self.framerate
-        self.camera.rotation = self.rotation
+        self._video_config = self.camera.create_video_configuration(
+            main={"size": self.resolution, "format": "YUV420"},
+            lores={"size": (640, 360), "format": "YUV420"},
+            transform=transform,
+            controls={
+                "FrameDurationLimits": (
+                    int(1e6 // self.framerate),
+                    int(1e6 // self.framerate),
+                )
+            },
+        )
+        self.camera.configure(self._video_config)
 
     def interruptGPIO(self, channel):
         """Activates when GPIO value is changed."""
 
-        camTime = self.camera.timestamp
+        camTime = int(time.time() * 1e6)  # microseconds (wall clock)
         piTime = self.getTime()
-        PinStatus = int(GPIO.input(self.camPin) == GPIO.HIGH)
 
-        # Denoising
-        if PinStatus != self.GPIO_Old:
-            self.GPIO_Old = PinStatus
-        else:
+        event = self._gpio_line.read_edge_events()
+        if not event:
             return
+        for ev in event:
+            PinStatus = 1 if ev.event_type == ev.Type.RISING_EDGE else 0
+            # Denoising
+            if PinStatus != self.GPIO_Old:
+                self.GPIO_Old = PinStatus
+            else:
+                continue
+            self.GPIOqueue.put((PinStatus, camTime, piTime))
 
-        self.GPIOqueue.put((PinStatus, camTime, piTime))
-        return
+    def _gpio_event_loop(self):
+        """Background thread that polls gpiod for edge events."""
+        while not self.stopRequested:
+            if self._gpio_line.wait_edge_events(
+                timeout=datetime.timedelta(milliseconds=100)
+            ):
+                camTime = int(time.time() * 1e6)
+                piTime = self.getTime()
+                for ev in self._gpio_line.read_edge_events():
+                    PinStatus = 1 if ev.event_type == ev.Type.RISING_EDGE else 0
+                    if PinStatus != self.GPIO_Old:
+                        self.GPIO_Old = PinStatus
+                        self.GPIOqueue.put((PinStatus, camTime, piTime))
 
     def setupGPIO(self):
-        """Setup GPIO to communicate with Teensy board ## BCM to BOARD"""
+        """Setup GPIO to communicate with Teensy board using gpiod (Pi 5 compatible)."""
+        global _gpio_chip, _gpio_lines
 
         self.GPIOqueue = queue.Queue()
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(self.camPin, GPIO.IN, GPIO.PUD_DOWN)
-        GPIO.add_event_detect(self.camPin, GPIO.BOTH, self.interruptGPIO)
+        _gpio_chip = gpiod.request_lines(
+            "/dev/gpiochip4",
+            consumer="picam-gpio",
+            config={
+                self.camPin: LineSettings(
+                    direction=Direction.INPUT,
+                    bias=Bias.PULL_DOWN,
+                    edge_detection=Edge.BOTH,
+                ),
+            },
+        )
+        self._gpio_line = _gpio_chip
+        _gpio_lines = _gpio_chip
+
+        # Start background GPIO event polling thread
+        self._gpio_thread = threading.Thread(
+            name="GPIOEventLoop", target=self._gpio_event_loop, daemon=True
+        )
+        self._gpio_thread.start()
 
     def setBuffer(
         self,
@@ -877,30 +858,35 @@ class PiCameraObject(object):
         return time.time() + self.getTimeDiffUTC()
 
     def getGains(self):
-        """Get camera gains."""
+        """Get camera gains via picamera2 metadata."""
 
+        metadata = self.camera.capture_metadata()
         params = numpy.empty([6, 1])
-        g = self.camera.awb_gains
-        params[0] = self.camera.exposure_speed
-        params[1] = self.camera.iso
-        params[2] = g[0]
-        params[3] = g[1]
-        params[4] = self.camera.analog_gain
-        params[5] = self.camera.digital_gain
+        params[0] = metadata.get("ExposureTime", 0)
+        # picamera2 does not expose ISO directly; approximate from AnalogueGain
+        params[1] = int(metadata.get("AnalogueGain", 1) * 100)
+        colour_gains = metadata.get("ColourGains", (1.0, 1.0))
+        params[2] = colour_gains[0]
+        params[3] = colour_gains[1]
+        params[4] = metadata.get("AnalogueGain", 1.0)
+        params[5] = metadata.get("DigitalGain", 1.0)
         return params
 
     def resetGains(self):
-        """Reset camera gain."""
+        """Reset camera to auto mode."""
 
         logging.debug("Resetting camera to auto mode ...")
-        self.camera.awb_mode = "auto"
-        self.camera.iso = 0
-        self.camera.shutter_speed = 0
-        self.camera.exposure_compensation = 0
-        self.camera.exposure_mode = "sports"
+        self.camera.set_controls(
+            {
+                "AeEnable": True,
+                "AwbEnable": True,
+                "ExposureTime": 0,
+                "AnalogueGain": 0,
+            }
+        )
 
     def loadGains(self, params=""):
-        """Loads camera gains."""
+        """Loads camera gains from a .params file or parameter list."""
 
         if not params:
             logging.debug("Finding most recent parameter file ...")
@@ -919,7 +905,7 @@ class PiCameraObject(object):
                     params = params + ".params"
                 filename = os.path.join(self.root, params)
                 file = open(filename)
-            except:
+            except Exception:
                 logging.debug("File not found")
                 return
             reader = csv.reader(file)
@@ -935,42 +921,16 @@ class PiCameraObject(object):
         elif len(params) == 9:
             self.rotation = int(params[6])
             self.framerate = int(params[7])
-            if self.camera.recording:
+            if self._recording:
                 logging.debug("Cannot load rotation/framerate/bitrate while recording!")
             else:
-                self.setSensorMode()
+                self.configureSensor()
+                self.bitrate = int(int(params[8]) * 1e6)
         else:
             logging.debug("Wrong number of parameters!")
             return None
 
-        self.resetGains()
-        logging.debug("Setting camera to loaded gain values ...")
-        self.camera.iso = int(params[1])
-        time.sleep(1)
-        self.camera.shutter_speed = int(params[0])
-        time.sleep(1)
-        self.camera.awb_mode = "auto"  # 'off'
-        self.camera.awb_gains = (params[2], params[3])
-        while (
-            abs(self.camera.digital_gain - params[5]) > 0.05
-            and abs(self.camera.exposure_compensation) < 25
-        ):
-            if self.camera.digital_gain > params[5]:  # gain too high, make darker
-                self.camera.exposure_compensation -= 1
-            else:
-                self.camera.exposure_compensation += 1
-            time.sleep(0.3)
-        self.camera.exposure_mode = "off"
-        self.camera.exposure_compensation = 0
-        ebest = (None, 1000000)
-        s = int(params[0])
-        while abs(params[0] - self.camera.exposure_speed) <= ebest[1] and ebest[1] > 0:
-            ebest = (s, abs(params[0] - self.camera.exposure_speed))
-            s = s + 10
-            self.camera.shutter_speed = s
-            time.sleep(0.3)
-        self.camera.shutter_speed = ebest[0]
-        time.sleep(0.3)
+        self._apply_gain_params(params)
 
         if len(params) == 9:
             logging.debug(
@@ -978,8 +938,9 @@ class PiCameraObject(object):
             )
         else:
             logging.debug("Loaded: %d %d %1.3f %1.3f %1.3f %1.3f" % tuple(params))
-        logging.debug("Actual exposure time: %d" % self.camera.exposure_speed)
-        logging.debug("Actual digital gain: %1.3f" % self.camera.digital_gain)
+        meta = self.camera.capture_metadata()
+        logging.debug("Actual exposure time: %d" % meta.get("ExposureTime", 0))
+        logging.debug("Actual digital gain: %1.3f" % meta.get("DigitalGain", 1.0))
 
         if len(params) == 9:
             if int(params[8]) is not None:
@@ -987,67 +948,44 @@ class PiCameraObject(object):
         else:
             return None
 
+    def _apply_gain_params(self, params):
+        """Apply gain parameters to the camera using picamera2 controls."""
+        self.resetGains()
+        logging.debug("Setting camera to loaded gain values ...")
+        time.sleep(1)
+        controls = {
+            "AeEnable": False,
+            "AwbEnable": False,
+            "ExposureTime": int(params[0]),
+            "AnalogueGain": float(params[4]) if params[4] > 0 else 1.0,
+            "ColourGains": (float(params[2]), float(params[3])),
+        }
+        self.camera.set_controls(controls)
+        time.sleep(1)
+
     def setGainsParam(self, ShSp, ISO, WG1, WG2, AnG, DiG, Rot, FPS, BRate):
-        """Loads camera gains."""
+        """Loads camera gains from explicit parameters."""
 
         params = [ShSp, ISO, WG1, WG2, AnG, DiG, Rot, FPS, BRate]
 
         # Set rotation, fps, and bitrate
         self.rotation = int(params[6])
         self.framerate = int(params[7])
-        if self.camera.recording:
+        if self._recording:
             logging.debug("Cannot load rotation/framerate/bitrate while recording!")
         else:
-            self.setSensorMode()
+            self.configureSensor()
             self.bitrate = int(int(params[8]) * 1e6)
 
-        # Reset camera gains
-        self.resetGains()
-
-        logging.debug("Setting camera to loaded gain values ...")
-
-        # Set camera ISO
-        self.camera.iso = int(params[1])
-        time.sleep(1)
-
-        # Set camera shutter speed
-        self.camera.shutter_speed = int(params[0])
-        time.sleep(1)
-
-        # Set camera auto white balance
-        self.camera.awb_mode = "auto"  # 'off'
-        self.camera.awb_gains = (params[2], params[3])
-
-        # Set camera digital gain
-        while (
-            abs(self.camera.digital_gain - params[5]) > 0.05
-            and abs(self.camera.exposure_compensation) < 25
-        ):
-            if self.camera.digital_gain > params[5]:  # gain too high, make darker
-                self.camera.exposure_compensation -= 1
-            else:
-                self.camera.exposure_compensation += 1
-            time.sleep(0.3)
-
-        # Set camera shutter speed
-        self.camera.exposure_mode = "off"
-        self.camera.exposure_compensation = 0
-        ebest = (None, 1000000)
-        s = int(params[0])
-        while abs(params[0] - self.camera.exposure_speed) <= ebest[1] and ebest[1] > 0:
-            ebest = (s, abs(params[0] - self.camera.exposure_speed))
-            s = s + 10
-            self.camera.shutter_speed = s
-            time.sleep(0.3)
-        self.camera.shutter_speed = ebest[0]
-        time.sleep(0.3)
+        self._apply_gain_params(params)
 
         logging.debug(
             "Loaded: %d %d %1.3f %1.3f %1.3f %1.3f %d %d %1.1f" % tuple(params)
         )
 
-        logging.debug("Actual exposure time: %d" % self.camera.exposure_speed)
-        logging.debug("Actual digital gain: %1.3f" % self.camera.digital_gain)
+        meta = self.camera.capture_metadata()
+        logging.debug("Actual exposure time: %d" % meta.get("ExposureTime", 0))
+        logging.debug("Actual digital gain: %1.3f" % meta.get("DigitalGain", 1.0))
 
     def loadGainsFile(self):
         """Loads camera gains from most recent file inside /GainSettings folder."""
@@ -1090,59 +1028,21 @@ class PiCameraObject(object):
         # Set rotation, fps, and bitrate
         self.rotation = int(params[6])
         self.framerate = int(params[7])
-        if self.camera.recording:
+        if self._recording:
             logging.debug("Cannot load rotation/framerate/bitrate while recording!")
         else:
-            self.setSensorMode()
+            self.configureSensor()
             self.bitrate = int(int(params[8]) * 1e6)
 
-        # Reset camera gains
-        self.resetGains()
-
-        logging.debug("Setting camera to loaded gain values ...")
-
-        # Set camera ISO
-        self.camera.iso = int(params[1])
-        time.sleep(1)
-
-        # Set camera shutter speed
-        self.camera.shutter_speed = int(params[0])
-        time.sleep(1)
-
-        # Set camera auto white balance
-        self.camera.awb_mode = "auto"
-        self.camera.awb_gains = (params[2], params[3])
-
-        # Set camera digital gain
-        while (
-            abs(self.camera.digital_gain - params[5]) > 0.05
-            and abs(self.camera.exposure_compensation) < 25
-        ):
-            if self.camera.digital_gain > params[5]:  # gain too high, make darker
-                self.camera.exposure_compensation -= 1
-            else:
-                self.camera.exposure_compensation += 1
-            time.sleep(0.3)
-
-        # Set camera shutter speed
-        self.camera.exposure_mode = "off"
-        self.camera.exposure_compensation = 0
-        ebest = (None, 1000000)
-        s = int(params[0])
-        while abs(params[0] - self.camera.exposure_speed) <= ebest[1] and ebest[1] > 0:
-            ebest = (s, abs(params[0] - self.camera.exposure_speed))
-            s = s + 10
-            self.camera.shutter_speed = s
-            time.sleep(0.3)
-        self.camera.shutter_speed = ebest[0]
-        time.sleep(0.3)
+        self._apply_gain_params(params)
 
         logging.debug(
             "Loaded: %d %d %1.3f %1.3f %1.3f %1.3f %d %d %1.1f" % tuple(params)
         )
 
-        logging.debug("Actual exposure time: %d" % self.camera.exposure_speed)
-        logging.debug("Actual digital gain: %1.3f" % self.camera.digital_gain)
+        meta = self.camera.capture_metadata()
+        logging.debug("Actual exposure time: %d" % meta.get("ExposureTime", 0))
+        logging.debug("Actual digital gain: %1.3f" % meta.get("DigitalGain", 1.0))
 
     def signalReceived(self, sigID, stack):
         """Receives signal from other processors or even from itself."""
@@ -1179,19 +1079,13 @@ class PiCameraObject(object):
         self.stopRequested = True
 
     def initiateCamera(self):
-        """Initiates camera for recording."""
+        """Initiates camera for recording in circular buffer mode."""
 
-        # Specify pi camera output buffer
-        self.bufferOutput = PiCamBuffer(self.camera, seconds=self.bufferLen)
-
-        # Start camera recording with specified output buffer, format, bitrate, and splitter port
-        self.camera.start_recording(
-            self.bufferOutput,
-            format=self.format,
-            bitrate=self.bitrate,
-            splitter_port=self.splitter_port,
-            level="4.2",
-        )
+        self._encoder = H264Encoder(bitrate=self.bitrate)
+        self._circular_output = CircularOutput(buffersize=self.bufferLen)
+        self.camera.start()
+        self.camera.start_encoder(self._encoder, self._circular_output)
+        self._recording = True
         logging.debug("Recording initial video buffer ...")
         time.sleep(self.vidBuffer)
 
@@ -1205,22 +1099,26 @@ class PiCameraObject(object):
                 time.sleep(0.5)
 
     def startWebPreview(self):
-        """Starting Pi Camera web preview"""
+        """Starting Pi Camera web preview using picamera2 MJPEG encoder."""
 
         if not hasattr(self, "previewEvent"):
             self.previewEvent = threading.Event()
-        self.camera.start_recording(piCamWebOutput, format="mjpeg", splitter_port=2)
+        self._stream_encoder = MJPEGEncoder()
+        self._stream_encoder.output = FileOutput(piCamWebOutput)
+        self.camera.start_encoder(self._stream_encoder, name="lores")
+        self._streaming = True
         self.previewEvent.set()
 
     def stopWebPreview(self):
-        """Stop pi camera web preview
-        It clears thread, shutdowns streaming server, and stops camera on port 2
-        """
+        """Stop pi camera web preview."""
 
         if hasattr(self, "previewEvent"):
             self.previewEvent.clear()
         try:
-            self.camera.stop_recording(splitter_port=2)
+            if self._stream_encoder:
+                self.camera.stop_encoder(self._stream_encoder)
+                self._stream_encoder = None
+                self._streaming = False
         except Exception:
             pass
 
@@ -1240,14 +1138,38 @@ class PiCameraObject(object):
     def exitSafely(self):
         """Function to exit pi camera code safely."""
 
-        if self.previewEvent.isSet():
+        global _gpio_chip, _gpio_lines
+
+        if hasattr(self, "previewEvent") and self.previewEvent.isSet():
             self.stopWebPreview()
         if self.gainThreadRunning:
             self.gainEvent.clear()
-        if self.camera.recording:
-            self.camera.stop_recording(splitter_port=self.splitter_port)
+        try:
+            if self._encoder:
+                self.camera.stop_encoder(self._encoder)
+        except Exception:
+            pass
+        try:
+            if self._stream_encoder:
+                self.camera.stop_encoder(self._stream_encoder)
+        except Exception:
+            pass
+        try:
+            self.camera.stop()
+        except Exception:
+            pass
         self.camera.close()
-        GPIO.cleanup()
+        self._recording = False
+
+        # Cleanup gpiod resources
+        if _gpio_chip is not None:
+            try:
+                _gpio_chip.release()
+            except Exception:
+                pass
+            _gpio_chip = None
+            _gpio_lines = None
+
         logging.debug("Program ended with exit signal = " + str(exitInst.exitStatus))
         logging.debug("Camera code is stopped successfully.")
 
@@ -1294,12 +1216,17 @@ class PiCameraObject(object):
 
                         duration = round((vidStopTime - vidStartTime) / 1e6)
 
-                        self.bufferOutput.copy_to(
-                            self.videoFileName,
-                            self.framesFileName,
-                            vidStartTime,
-                            vidStopTime,
-                        )
+                        self._circular_output.fileoutput = self.videoFileName
+                        self._circular_output.start()
+                        time.sleep(0.1)
+                        self._circular_output.stop()
+                        # Write timestamps file
+                        try:
+                            with open(self.framesFileName, "w") as tfile:
+                                tfile.write("%d\n" % int(vidStartTime))
+                                tfile.write("0\n")
+                        except Exception as e:
+                            logging.warning("Failed to write frames file: %s", e)
                         logging.debug(
                             "%s: Saved %s (%d seconds)\n"
                             % (
@@ -1340,8 +1267,8 @@ class PiCameraObject(object):
                     with open(self.timeFileName, "w") as timeFile:
                         params = tuple(self.getGains())
                         params = params + (
-                            self.camera.rotation,
-                            self.camera.framerate,
+                            self.rotation,
+                            self.framerate,
                             int(self.bitrate / 1e6),
                         )
                         timeFile.write(
@@ -1403,6 +1330,11 @@ class PiCameraObject(object):
 
         self.recordSchedule()
         self.recordingStatus = False
+        self._cont_encoder = None
+        self._cont_output = None
+
+        # Start the camera (picamera2 needs the camera running to encode)
+        self.camera.start()
 
         try:
             eventLog = ""
@@ -1465,8 +1397,14 @@ class PiCameraObject(object):
                             )
                         )
                         if stopFlag:
-                            self.camera.stop_recording(splitter_port=self.splitter_port)
+                            if self._cont_encoder:
+                                self.camera.stop_encoder(self._cont_encoder)
+                                self._cont_encoder = None
+                            if self._cont_output:
+                                self._cont_output.close()
+                                self._cont_output = None
                             self.recordingStatus = False
+                            self._recording = False
                             logging.debug("Stopped recording.")
                             logging.debug("Waiting for alarm ...")
 
@@ -1474,7 +1412,7 @@ class PiCameraObject(object):
                     if startFlag or splitFlag:
                         startTime = self.getTime()
                         fname = "v%d-%05d" % (
-                            self.camera.framerate,
+                            self.framerate,
                             int(startTime) % 86400,
                         )
                         dname = getTimeFormat()
@@ -1491,24 +1429,23 @@ class PiCameraObject(object):
                         )
                         eventLog = ""  # clear events
 
+                        # Stop previous encoder if splitting
+                        if splitFlag and self._cont_encoder:
+                            self.camera.stop_encoder(self._cont_encoder)
+                            if self._cont_output:
+                                self._cont_output.close()
+
                         # setup output
-                        currOutput = PtsOutput(
-                            self.camera, videoFileName, framesFileName
+                        self._cont_output = PtsOutput(videoFileName, framesFileName)
+                        self._cont_encoder = H264Encoder(bitrate=self.bitrate)
+                        self.camera.start_encoder(
+                            self._cont_encoder,
+                            FileOutput(self._cont_output),
                         )
-                        if splitFlag:
-                            self.camera.split_recording(
-                                currOutput, splitter_port=self.splitter_port
-                            )
-                        else:
+                        if not splitFlag:
                             logging.debug("Started recording.")
-                            self.camera.start_recording(
-                                currOutput,
-                                format=self.format,
-                                bitrate=self.bitrate,
-                                splitter_port=self.splitter_port,
-                                level="4.2",
-                            )
-                            self.recordingStatus = True
+                        self.recordingStatus = True
+                        self._recording = True
 
                         logging.debug(
                             "%s: Begin %s"
@@ -1519,8 +1456,8 @@ class PiCameraObject(object):
                         with open(timeFileName, "w") as timeFile:
                             params = tuple(self.getGains())
                             params = params + (
-                                self.camera.rotation,
-                                self.camera.framerate,
+                                self.rotation,
+                                self.framerate,
                                 float(self.bitrate) / 1e6,
                             )
                             timeFile.write(
