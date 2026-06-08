@@ -23,7 +23,6 @@ from PIL import Image, ImageDraw, ImageFont  # Python Image module [change backg
 import pickle
 import StorageMonitor  # Background disk usage monitor
 
-
 TRIAL_SUMMARY_HEADER = (
     "eventCode,port1Prob,port2Prob,chosenPort,rewarded,trialId,blockId,"
     "unstructuredProb,sessionStartEpochMs,blockStartRelMs,trialStartRelMs,trialEndRelMs\n"
@@ -195,7 +194,7 @@ def getUserConfig(fileName, splitterChar):
             if not line:
                 continue
             if splitterChar in line:
-                (settingName, settingValue) = line.split(splitterChar, 1)
+                settingName, settingValue = line.split(splitterChar, 1)
                 settingName = settingName.strip()
                 settingValue = settingValue.strip()
                 # Optionally strip wrapping quotes from values
@@ -226,7 +225,7 @@ def compileUploadTeensy(userConfig):
     compileCmd = "arduino-cli compile -v /home/pi/AutoTrainerModular/AutoTrainerModular.ino \
                   --fqbn teensy:avr:teensy41 \
                   --output-dir /home/pi/AutoTrainerModular/Build \
-                  --libraries /home/pi/.arduino15/packages/teensy/hardware/avr/1.57.2/libraries"
+                  --libraries /home/pi/.arduino15/packages/teensy/hardware/avr/1.61.0/libraries"
 
     # compileCmd = "xvfb-run -a arduino --upload AutoTrainerModular.ino --board teensy:avr:teensy41:usb=serial,speed=600,opt=osstd"
 
@@ -269,6 +268,19 @@ def compileUploadTeensy(userConfig):
                 if isinstance(line, bytes):
                     line = line.decode("utf-8", "ignore")
                 print("   ... " + line)
+        except Exception:
+            pass
+        try:
+            if subError:
+                errText = (
+                    subError.decode("utf-8", "ignore")
+                    if isinstance(subError, bytes)
+                    else str(subError)
+                )
+                if errText.strip():
+                    print("   ... --- STDERR ---")
+                    for line in errText.splitlines():
+                        print("   ... " + line)
         except Exception:
             pass
         print("   ... ========================")
@@ -348,7 +360,7 @@ def getDSTInfo(fileName):
         for L in File:
             L = L.strip()
             S = L.split(",")
-            (Year, Days) = [S[0].strip(), [S[1].strip(), S[2].strip()]]
+            Year, Days = [S[0].strip(), [S[1].strip(), S[2].strip()]]
             DSTInfo[Year] = Days
     return DSTInfo
 
