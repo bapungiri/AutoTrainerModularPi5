@@ -222,10 +222,10 @@ def compileUploadTeensy(userConfig):
     print("   ... Killing the previous Teensy process if running.")
     subprocess.call(["pkill", "teensy"])
 
-    compileCmd = "arduino-cli compile -v /home/pi/AutoTrainerModular/AutoTrainerModular.ino \
-                  --fqbn teensy:avr:teensy41 \
-                  --output-dir /home/pi/AutoTrainerModular/Build \
-                  --libraries /home/pi/.arduino15/packages/teensy/hardware/avr/1.61.0/libraries"
+    compileCmd = "arduino --verify --board teensy:avr:teensy41 \
+                  --pref build.path=/home/pi/AutoTrainerModular/Build \
+                  --verbose \
+                  /home/pi/AutoTrainerModular/AutoTrainerModular.ino"
 
     # compileCmd = "xvfb-run -a arduino --upload AutoTrainerModular.ino --board teensy:avr:teensy41:usb=serial,speed=600,opt=osstd"
 
