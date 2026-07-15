@@ -12,7 +12,6 @@ import getpass  # Python get user input secure
 import re  # Python regular expression
 from datetime import datetime  # Timestamp for remote backups
 
-
 _BACKED_UP_TARGETS = set()
 
 
@@ -41,7 +40,7 @@ def getUserConfig(fileName, splitterChar):
     with open(fileName) as configFile:
         for eachLine in configFile:
             if "=" in eachLine:
-                (settingName, settingValue) = eachLine.split(splitterChar)
+                settingName, settingValue = eachLine.split(splitterChar)
                 settingName = settingName.strip()
                 settingValue = settingValue.strip()
                 userConfig[settingName] = settingValue
@@ -56,7 +55,7 @@ def createDicStr(str, splitterChar):
     dicT = {}
     for L in str:
         if "=" in L:
-            (N, V) = L.split(splitterChar)
+            N, V = L.split(splitterChar)
             N = N.strip()
             V = V.strip()
             dicT[N] = V

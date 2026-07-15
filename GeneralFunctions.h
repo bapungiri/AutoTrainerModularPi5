@@ -7,6 +7,14 @@
 
 #include "HardwareLibrary/HardwareClass.h" // ensure trialSummaryQueue & structs are visible
 
+// Millisecond epoch anchor updated by serial time-sync commands.
+// This decouples timestamping precision from TimeLib second granularity.
+static uint64_t g_epochAnchorMs = 0;
+static unsigned long g_epochAnchorLocalMillis = 0;
+static bool g_epochAnchorValid = false;
+
+uint64_t epochMillis();
+
 // -----------------------------------------   CreateHDW_DI
 void CreateHDW_DI(DI_HDW &pin, String pinNAM, uint8_t pinN, OnInterruptFunc Func, int interruptMode)
 {
@@ -525,7 +533,7 @@ void ReportData(int type, int value, int sessionTime)
   ReportStr.currentSM = currentStateMachine;
   ReportStr.currentTP = currentTrainingProtocol;
   ReportStr.smTime = sessionTime;
-  ReportStr.nowTime = now();
+  ReportStr.nowTime = (unsigned long)(epochMillis() / 1000ULL);
   ReportStr.dIntake = dailyIntake;
   ReportStr.wIntake = weeklyIntake;
 
@@ -595,7 +603,7 @@ void CheckArraySize(String parName, int arrSize, int S)
 // -----------------------------------------   SyncInitialTime
 void SyncInitialTime()
 {
-  Serial.println("I,Waiting for time sync message from master R-Pi (e.g. T1506298500)");
+  Serial.println("I,Waiting for time sync message from master R-Pi (e.g. T1506298500 or M1506298500123)");
   while (timeStatus() == timeNotSet)
   {
     serialEvent();
@@ -787,10 +795,36 @@ void serialEvent()
       long pctime;
       pctime = Serial.parseInt();
       setTime(pctime);
+      g_epochAnchorMs = (uint64_t)pctime * 1000ULL;
+      g_epochAnchorLocalMillis = millis();
+      g_epochAnchorValid = true;
       DigitalClockDisplay();
 
       // Reset Teensy health report time
       timeStampTeensy = now();
+    }
+
+    // Syncing millisecond epoch time: M<unix_epoch_ms>\n
+    if (firstChar == 'M')
+    {
+      String msStr = Serial.readStringUntil('\n');
+      msStr.trim();
+
+      if (msStr.length() > 0)
+      {
+        uint64_t pctimeMs = strtoull(msStr.c_str(), NULL, 10);
+        if (pctimeMs > 0)
+        {
+          g_epochAnchorMs = pctimeMs;
+          g_epochAnchorLocalMillis = millis();
+          g_epochAnchorValid = true;
+          setTime((time_t)(pctimeMs / 1000ULL));
+          Serial.println("I,Setting millisecond epoch anchor ...");
+
+          // Reset Teensy health report time
+          timeStampTeensy = now();
+        }
+      }
     }
 
     // Changing alarms
@@ -831,19 +865,21 @@ void writeGlobalParameters()
 // Returns Unix epoch in milliseconds (64‑bit)
 uint64_t epochMillis()
 {
-  static time_t lastSec = 0;
-  static unsigned long secBaseMillis = 0;
-  time_t s = now();
-  // When the second value changes, capture the millis() at that boundary
-  if (s != lastSec)
+  if (g_epochAnchorValid)
   {
-    lastSec = s;
-    secBaseMillis = millis();
+    return g_epochAnchorMs + (uint64_t)(millis() - g_epochAnchorLocalMillis);
   }
-  // millisSinceSec: how many ms since the captured second boundary
-  unsigned long msSinceSec = millis() - secBaseMillis; // handles rollover via unsigned arithmetic
-  if (msSinceSec > 999)
-    msSinceSec = 999; // clamp (in case of slight scheduling lag)
-  return (uint64_t)s * 1000ULL + (uint64_t)msSinceSec;
+
+  // Fallback if no sync has been received yet.
+  static uint64_t fallbackBaseMs = 0;
+  static unsigned long fallbackLocalMillis = 0;
+  static bool fallbackInitialized = false;
+  if (!fallbackInitialized)
+  {
+    fallbackBaseMs = (uint64_t)now() * 1000ULL;
+    fallbackLocalMillis = millis();
+    fallbackInitialized = true;
+  }
+  return fallbackBaseMs + (uint64_t)(millis() - fallbackLocalMillis);
 }
 #endif

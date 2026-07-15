@@ -382,56 +382,61 @@ def dstStatus(dt, DSTInfo):
 
 def syncTimeNTP(ser, userConfig, msgFileN=None):
     """
-    Function to sync Teensy date/time with Network Time Protocol (NTP)
+    Function to sync Teensy date/time from RPi system clock.
+    The RPi clock is expected to be NTP-synced by syncRPiTime().
     """
 
-    # Find time offset between current and UTC time zone in sec
-    TimeDiffUTC = -time.timezone
-
-    # Apply Daylight Saving
-    # DSTInfo = getDSTInfo('DST.dat')
-    # if dstStatus(datetime.datetime.now(), DSTInfo):
-    #    TimeDiffUTC += 3600
-
-    # Get the time from NTPServer
+    # Use local RPi clock (already NTP-synced at startup) to avoid network
+    # latency/jitter on every periodic Teensy resync.
     try:
-        client = ntplib.NTPClient()
-        response = client.request(userConfig["NTPServer"], timeout=5)
-        timeT = "T" + str(response.tx_time + TimeDiffUTC)
+        utc_epoch_ms = int(time.time() * 1000)
+        tz_offset = datetime.datetime.now().astimezone().utcoffset()
+        offset_ms = int(tz_offset.total_seconds() * 1000) if tz_offset else 0
+
+        # Preserve legacy behavior where Teensy clock tracks local wall time.
+        epoch_ms = utc_epoch_ms + offset_ms
+        epoch_s = epoch_ms // 1000
+
+        # Legacy seconds sync (for backward compatibility).
+        timeT = "T" + str(epoch_s) + "\n"
         try:
             ser.write(timeT.encode("ascii", "ignore"))
         except Exception:
             ser.write(timeT)  # fallback
+
+        # High-resolution sync used by updated firmware.
+        timeM = "M" + str(epoch_ms) + "\n"
+        try:
+            ser.write(timeM.encode("ascii", "ignore"))
+        except Exception:
+            ser.write(timeM)  # fallback
+
         if msgFileN:
             msgList = [
                 "Info: syncTimeNTP",
                 "RPi Time: " + getTimeFormat(),
-                "NTP Time: " + timeT.replace("T", ""),
-                "NTP to Local: "
-                + time.strftime(
-                    "%Y-%m-%d %H:%M:%S", time.localtime(float(response.tx_time))
-                ),
+                "RPi Local Offset (ms): " + str(offset_ms),
+                "RPi Epoch Seconds Sent: " + str(epoch_s),
+                "RPi Epoch Milliseconds Sent: " + str(epoch_ms),
             ]
             writeLogFile(msgFileN, msgList)
         else:
-            print("   ... Teensy date and time synced with " + userConfig["NTPServer"])
+            print("   ... Teensy date and time synced from RPi system clock")
 
     except Exception as e:
         if msgFileN:
             msgList = [
                 "Error:",
                 "EXCEPTION HAPPENED.",
-                "The program could not sync Teensy time with NTP time server.",
-                "Check the internet connection and re-run the program.",
+                "The program could not sync Teensy time from RPi clock.",
+                "Check serial connection and re-run the program.",
                 "Error : %s: %s \n" % (e.__class__, e),
             ]
             writeLogFile(msgFileN, msgList)
         else:
             print("   ... * EXCEPTION HAPPENED.")
-            print(
-                "   ... * The program could not sync Teensy time with NTP time server."
-            )
-            print("   ... * Check the internet connection and re-run the program.")
+            print("   ... * The program could not sync Teensy time from RPi clock.")
+            print("   ... * Check serial connection and re-run the program.")
             print("   ... * Error : %s: %s \n" % (e.__class__, e))
             exitInst.exitStatus = True
             return
