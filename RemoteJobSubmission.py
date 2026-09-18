@@ -31,6 +31,29 @@ def createSSHClient(rpiHost, rpiUser, rpiPass):
         print("   ... * Error : %s: %s" % (e.__class__, e))
 
 
+def checkVenvPython(ssh, venvPy, rpiHost):
+    """
+    Check that the configured venv's python executable exists on the remote
+    host. Returns True if found, prints a warning and returns False otherwise.
+    """
+
+    if ssh is None:
+        return False
+
+    stdin, stdout, stderr = ssh.exec_command("test -x '%s' && echo VENV_OK" % venvPy)
+    result = stdout.read().decode().strip()
+
+    if result == "VENV_OK":
+        return True
+
+    print("   ... * WARNING: Venv python not found on RPi [" + rpiHost + "]: " + venvPy)
+    print(
+        "   ... * WARNING: Check 'Venv_Path' in userInfo.in matches the "
+        "virtual environment created on this Pi."
+    )
+    return False
+
+
 def getUserConfig(fileName, splitterChar):
     """
     Function to read the user configuration file as a dictionary.
@@ -577,6 +600,11 @@ def deployAudioRecording(
 
     rpiSSH = createSSHClient(ipAdd, rpiUser, rpiPass)
 
+    venvPy = userConfig.get("Venv_Path", "/home/pi/atm_env") + "/bin/python3"
+    if not checkVenvPython(rpiSSH, venvPy, ipAdd):
+        rpiSSH.close()
+        return
+
     backup_remote_directory(
         rpiSSH,
         rpiRoot.rstrip("/"),
@@ -598,7 +626,7 @@ def deployAudioRecording(
     print("   ... Deployed -> new audio recording: [" + setFile + "]-[" + ipAdd + "]")
 
     S1 = " ".join(
-        ["nohup ./PyAudioRecorder.py", "</dev/null >/home/pi/log4.out 2>&1 &"]
+        ["nohup", venvPy, "PyAudioRecorder.py", "</dev/null >/home/pi/log4.out 2>&1 &"]
     )
     rpiCommands = "".join(
         [
@@ -630,6 +658,7 @@ def deployPiCamTransfer(
     """Deploy picamera and transfer code to RPi devicess."""
 
     camDic = getCamDic(userConfig)
+    venvPy = userConfig.get("Venv_Path", "/home/pi/atm_env") + "/bin/python3"
     for cam in camDic:
         print("   ... ==============")
         ipAdd = camDic[cam][0]
@@ -661,6 +690,10 @@ def deployPiCamTransfer(
             exit()
 
         rpiSSH = createSSHClient(ipAdd, rpiUser, rpiPass)
+
+        if not checkVenvPython(rpiSSH, venvPy, ipAdd):
+            rpiSSH.close()
+            continue
 
         backup_remote_directory(
             rpiSSH,
@@ -780,7 +813,13 @@ def deployPiCamTransfer(
         )
 
         S1 = " ".join(
-            ["nohup ./PiCamMain.py -f", setFile, "</dev/null >/home/pi/log2.out 2>&1 &"]
+            [
+                "nohup",
+                venvPy,
+                "PiCamMain.py -f",
+                setFile,
+                "</dev/null >/home/pi/log2.out 2>&1 &",
+            ]
         )
         rpiCommands = "".join(
             [
@@ -804,7 +843,9 @@ def deployPiCamTransfer(
 
         S2 = " ".join(
             [
-                "nohup ./FileTransfer.py -f",
+                "nohup",
+                venvPy,
+                "FileTransfer.py -f",
                 setFile,
                 "</dev/null >/home/pi/log3.out 2>&1 &",
             ]
@@ -845,6 +886,7 @@ def main():
 
     # Read user configuration
     userConfig = getUserConfig("userInfo.in", "=")
+    venvPy = userConfig.get("Venv_Path", "/home/pi/atm_env") + "/bin/python3"
 
     # Get root directory working for both windows and linux (or Mac)
     root = os.path.realpath("")
@@ -877,6 +919,10 @@ def main():
 
     # Create an SSH client to master RPi
     rpiSSH = createSSHClient(rpiHost, rpiUser, rpiPass)
+
+    if not checkVenvPython(rpiSSH, venvPy, rpiHost):
+        rpiSSH.close()
+        return
 
     # Check if a job is already running in RPi
     if ("Run_Camera" in userConfig) or ("Run_Microphone" in userConfig):
@@ -953,7 +999,9 @@ def main():
         )
         S2 = " ".join(
             [
-                "nohup ./FileTransfer.py -f camInfoM.in </dev/null >/home/pi/log5.out 2>&1 &"
+                "nohup",
+                venvPy,
+                "FileTransfer.py -f camInfoM.in </dev/null >/home/pi/log5.out 2>&1 &",
             ]
         )
         rpiCommands = "".join(
@@ -993,7 +1041,7 @@ def main():
             sep,
             "export PYTHONUNBUFFERED=1",
             sep,
-            "nohup ./MainCode.py  > log.out &",
+            "nohup " + venvPy + " MainCode.py  > log.out &",
         ]
     )
 

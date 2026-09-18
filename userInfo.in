@@ -92,6 +92,7 @@ NTPServer           = ntp.iisc.ac.in
 Cred_File           = cred.in.gz
 RPi_ID              = pi
 RPi_Pass            = Dlabrpi!
+Venv_Path           = /home/pi/venvs/teensy
 WD_Email            = dhawalelabrpi@gmail.com
 WD_Pass             = 2|||Y1hOMVpIZG9hMlZ4YTNscGJHcHdjQT09
 WD_SMTP             = smtp.gmail.com

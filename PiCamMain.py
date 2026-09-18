@@ -69,7 +69,7 @@ def getUserConfig(fileName, splitterChar):
     with open(fileName) as configFile:
         for eachLine in configFile:
             if "=" in eachLine:
-                (settingName, settingValue) = eachLine.split(splitterChar)
+                settingName, settingValue = eachLine.split(splitterChar)
                 settingName = settingName.strip()
                 settingValue = settingValue.strip()
                 userConfig[settingName] = settingValue
@@ -673,9 +673,6 @@ class PiCameraObject(object):
     def interruptGPIO(self, channel):
         """Activates when GPIO value is changed."""
 
-        camTime = int(time.time() * 1e6)  # microseconds (wall clock)
-        piTime = self.getTime()
-
         event = self._gpio_line.read_edge_events()
         if not event:
             return
@@ -686,6 +683,11 @@ class PiCameraObject(object):
                 self.GPIO_Old = PinStatus
             else:
                 continue
+            # Stamp with the edge's own hardware timestamp rather than a
+            # delayed time.time() call, to avoid scheduling jitter.
+            wallSec = self._edgeTimestampToWall(ev.timestamp_ns)
+            camTime = int(wallSec * 1e6)  # microseconds (wall clock)
+            piTime = wallSec + self.getTimeDiffUTC()
             self.GPIOqueue.put((PinStatus, camTime, piTime))
 
     def _gpio_event_loop(self):
@@ -694,12 +696,16 @@ class PiCameraObject(object):
             if self._gpio_line.wait_edge_events(
                 timeout=datetime.timedelta(milliseconds=100)
             ):
-                camTime = int(time.time() * 1e6)
-                piTime = self.getTime()
                 for ev in self._gpio_line.read_edge_events():
                     PinStatus = 1 if ev.event_type == ev.Type.RISING_EDGE else 0
                     if PinStatus != self.GPIO_Old:
                         self.GPIO_Old = PinStatus
+                        # Stamp with the edge's own hardware timestamp
+                        # rather than a delayed time.time() call, to avoid
+                        # poll/scheduling jitter (up to the 100ms timeout).
+                        wallSec = self._edgeTimestampToWall(ev.timestamp_ns)
+                        camTime = int(wallSec * 1e6)
+                        piTime = wallSec + self.getTimeDiffUTC()
                         self.GPIOqueue.put((PinStatus, camTime, piTime))
 
     def setupGPIO(self):
@@ -825,7 +831,7 @@ class PiCameraObject(object):
             for L in File:
                 L = L.strip()
                 S = L.split(",")
-                (Year, Days) = [S[0].strip(), [S[1].strip(), S[2].strip()]]
+                Year, Days = [S[0].strip(), [S[1].strip(), S[2].strip()]]
                 dic[Year] = Days
         return dic
 
@@ -856,6 +862,20 @@ class PiCameraObject(object):
         """Return epoch time in local time zone considering daylight saving"""
 
         return time.time() + self.getTimeDiffUTC()
+
+    def _edgeTimestampToWall(self, timestamp_ns):
+        """Convert a gpiod edge event's hardware timestamp (nanoseconds,
+        CLOCK_MONOTONIC by default) to wall-clock epoch seconds.
+
+        gpiod captures edge timestamps in kernel/interrupt context at the
+        moment of the electrical transition. Stamping events this way
+        avoids the scheduling/poll-wakeup jitter incurred by calling
+        time.time() after the fact in userspace.
+        """
+
+        anchor_monotonic_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        anchor_wall = time.time()
+        return anchor_wall + (timestamp_ns - anchor_monotonic_ns) / 1e9
 
     def getGains(self):
         """Get camera gains via picamera2 metadata."""
@@ -1248,7 +1268,7 @@ class PiCameraObject(object):
 
                 # start recording
                 if recordFlag == 0 and lastGPIO[0] % 2 == 1:
-                    (camStartTime, startTime) = lastGPIO[1:]
+                    camStartTime, startTime = lastGPIO[1:]
                     lastGPIOtime = lastGPIO[2]
 
                     fname = "v%d-%05d" % (self.framerate, int(startTime) % 86400)

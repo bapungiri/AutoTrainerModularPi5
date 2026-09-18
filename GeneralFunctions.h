@@ -13,6 +13,15 @@ static uint64_t g_epochAnchorMs = 0;
 static unsigned long g_epochAnchorLocalMillis = 0;
 static bool g_epochAnchorValid = false;
 
+// Drift-rate compensation: estimated ratio of real elapsed time to Teensy
+// millis() elapsed time, measured between consecutive high-resolution 'M'
+// syncs. Applied continuously (not just stepped at sync points) to correct
+// for the Teensy crystal's fixed frequency error between syncs.
+static double g_epochRate = 1.0;
+// Minimum interval (Teensy ms) required between two 'M' syncs before trusting
+// a freshly computed rate; shorter intervals are too noisy (serial/quantization jitter).
+#define MIN_RATE_CALC_INTERVAL_MS 30000UL
+
 uint64_t epochMillis();
 
 // -----------------------------------------   CreateHDW_DI
@@ -815,8 +824,29 @@ void serialEvent()
         uint64_t pctimeMs = strtoull(msStr.c_str(), NULL, 10);
         if (pctimeMs > 0)
         {
+          unsigned long nowLocalMillis = millis();
+
+          // Estimate the Teensy's clock drift rate using the previous
+          // 'M' sync anchor before it gets overwritten below.
+          if (g_epochAnchorValid)
+          {
+            uint64_t realElapsedMs = pctimeMs - g_epochAnchorMs;
+            unsigned long teensyElapsedMs = nowLocalMillis - g_epochAnchorLocalMillis;
+
+            if (teensyElapsedMs >= MIN_RATE_CALC_INTERVAL_MS && realElapsedMs > 0)
+            {
+              double rate = (double)realElapsedMs / (double)teensyElapsedMs;
+              // Sanity clamp (+/-0.5%): reject bogus values from a
+              // corrupted/garbled sync command rather than corrupting the rate.
+              if (rate > 0.995 && rate < 1.005)
+              {
+                g_epochRate = rate;
+              }
+            }
+          }
+
           g_epochAnchorMs = pctimeMs;
-          g_epochAnchorLocalMillis = millis();
+          g_epochAnchorLocalMillis = nowLocalMillis;
           g_epochAnchorValid = true;
           setTime((time_t)(pctimeMs / 1000ULL));
           Serial.println("I,Setting millisecond epoch anchor ...");
@@ -867,7 +897,11 @@ uint64_t epochMillis()
 {
   if (g_epochAnchorValid)
   {
-    return g_epochAnchorMs + (uint64_t)(millis() - g_epochAnchorLocalMillis);
+    // Apply the drift-rate correction continuously (not just at sync
+    // points) to compensate for the Teensy crystal's frequency error.
+    unsigned long elapsedTicks = millis() - g_epochAnchorLocalMillis; // unsigned arithmetic handles rollover
+    double correctedElapsedMs = (double)elapsedTicks * g_epochRate;
+    return g_epochAnchorMs + (uint64_t)(correctedElapsedMs + 0.5);
   }
 
   // Fallback if no sync has been received yet.
