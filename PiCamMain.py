@@ -5,9 +5,10 @@ import io  # input/output module
 import sys  # System utility module
 from picamera2 import Picamera2  # Pi Camera module (Pi 5 compatible)
 from picamera2.encoders import H264Encoder, MJPEGEncoder, Quality
-from picamera2.outputs import FileOutput, CircularOutput
+from picamera2.outputs import FileOutput, Output
 from libcamera import controls as libcamera_controls
 import time  # Time module
+import collections  # deque for the frame ring buffer
 import datetime  # Datetime utility
 import logging  # Debugging tool
 import gpiod  # GPIO utility (Pi 5 compatible)
@@ -470,47 +471,57 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
     daemon_threads = True
 
 
-class PiCamBuffer(object):
-    """Circular buffer wrapper for picamera2.
+class PiCamBuffer(Output):
+    """Ring buffer of encoded H.264 frames, cut into clips by time.
 
-    Wraps picamera2's CircularOutput to provide a copy_to method
-    that extracts video segments with timestamp files, similar to the
-    legacy picamera PiCameraCircularIO interface.
+    Plays the role of picamera's PiCameraCircularIO on the Pi3B: keeps the last
+    'seconds' of frames with wall-clock timestamps (us, the clock of the GPIO
+    edge times), and copy_to saves startTime..stopTime from the last key frame
+    at or before startTime.
     """
 
-    def __init__(self, circular_output, camera):
-        self.circular_output = circular_output
-        self.camera = camera
+    def __init__(self, encoder, seconds):
+        super().__init__()
+        self.encoder = encoder
+        self.seconds = seconds
+        self.frames = collections.deque()  # (wall_us, keyframe, bytes)
+        self.lock = threading.Lock()
+
+    def outputframe(self, frame, keyframe=True, timestamp=None, packet=None, audio=False):
+        if audio or timestamp is None or self.encoder.firsttimestamp is None:
+            return
+        # timestamp is the sensor time (us, boot clock = CLOCK_MONOTONIC on a Pi that
+        # never suspends) minus the first frame's
+        offset_us = (time.time() - time.clock_gettime(time.CLOCK_MONOTONIC)) * 1e6
+        wall_us = timestamp + self.encoder.firsttimestamp + offset_us
+        with self.lock:
+            self.frames.append((wall_us, keyframe, bytes(frame)))
+            while wall_us - self.frames[0][0] > self.seconds * 1e6:
+                self.frames.popleft()
 
     def copy_to(self, output, tfilename, startTime, stopTime=None):
-        """Save buffered video to a file and write frame timestamps.
+        """Save frames from startTime to stopTime (us) and their times to tfilename."""
 
-        Parameters:
-            output      : output file path (str) or file-like object
-            tfilename   : path for the timestamp file
-            startTime   : start timestamp in microseconds
-            stopTime    : stop timestamp in microseconds (optional)
-        """
-        if isinstance(output, bytes):
-            output = output.decode("utf-8")
-        opened = isinstance(output, str)
-        if opened:
-            out_file = open(output, "wb")
-        else:
-            out_file = output
-        try:
-            self.circular_output.outputframe(0, out_file)
-        finally:
-            if opened:
-                out_file.close()
+        with self.lock:
+            frames = list(self.frames)
+        first = None
+        for i, (t, key, _) in enumerate(frames):
+            if t > startTime:
+                break
+            if key:
+                first = i
+        if first is None:
+            logging.debug("Clip start no longer in the buffer; not saved.")
+            return
+        clip = [f for f in frames[first:] if stopTime is None or f[0] <= stopTime]
 
-        # Write timestamps file
-        try:
-            with open(tfilename, "w") as tfile:
-                tfile.write("%d\n" % int(startTime))
-                tfile.write("0\n")
-        except Exception as e:
-            logging.warning("Failed to write timestamp file: %s", e)
+        with open(output, "wb") as out_file:
+            for _, _, b in clip:
+                out_file.write(b)
+        tstart = clip[0][0]
+        with open(tfilename, "w") as tfile:
+            tfile.write("%d\n" % tstart)
+            tfile.write("\n".join(str(int(t - tstart)) for t, _, _ in clip))
 
 
 class PtsOutput(object):
@@ -581,7 +592,7 @@ class PiCameraObject(object):
         self.stopRequested = False
         self._recording = False
         self._streaming = False
-        self._circular_output = None
+        self.bufferOutput = None
         self._encoder = None
         self._stream_encoder = None
         signal.signal(signal.SIGHUP, self.signalReceived)
@@ -690,22 +701,30 @@ class PiCameraObject(object):
         self,
         preEventSaveTime=2,
         initialWaitTime=10,
-        inactivityTime=2,
+        inactivityTime=5,
+        postEventSaveTime=2,
         circularBufferSize=60,
+        maxClipTime=50,
     ):
         """Sets camera buffer parameters.
 
         Parameters:
-            preEventSaveTime   : Minimum pre-event buffer in sec
-            initialWaitTime    : Initial wait time in sec
-            inactivityTime     : Second event wait time in sec
+            preEventSaveTime   : Video kept before the first event, in sec
+            initialWaitTime    : Close the clip if the line stays high this long, in sec
+            inactivityTime     : Close the clip after this long with no event, in sec
+                                 (long enough to keep a poke and its licks in one clip)
+            postEventSaveTime  : Video kept after the last event, in sec
             circularBufferSize : Total ring buffer size in sec
+            maxClipTime        : Save a clip once it is this long, in sec, before its
+                                 start leaves the ring buffer
         """
 
         self.vidBuffer = preEventSaveTime
         self.T1 = initialWaitTime
         self.T2 = inactivityTime
+        self.postBuffer = postEventSaveTime
         self.bufferLen = circularBufferSize
+        self.maxClip = maxClipTime
 
     def setStorage(self, dirPath=None):
         """Set storage path for video files.
@@ -1054,10 +1073,12 @@ class PiCameraObject(object):
     def initiateCamera(self):
         """Initiates camera for recording in circular buffer mode."""
 
-        self._encoder = H264Encoder(bitrate=self.bitrate)
-        self._circular_output = CircularOutput(buffersize=self.bufferLen)
+        # a key frame (with repeated headers) every second, so a clip can start
+        # within a second of its pre-event time and plays on its own
+        self._encoder = H264Encoder(bitrate=self.bitrate, iperiod=self.framerate)
+        self.bufferOutput = PiCamBuffer(self._encoder, self.bufferLen)
         self.camera.start()
-        self.camera.start_encoder(self._encoder, self._circular_output)
+        self.camera.start_encoder(self._encoder, self.bufferOutput)
         self._recording = True
         logging.debug("Recording initial video buffer ...")
         time.sleep(self.vidBuffer)
@@ -1172,34 +1193,31 @@ class PiCameraObject(object):
                     if self.stopRequested:
                         raise Exception("StopRequested")
 
-                    # stop and close video if time elapses
-                    if (
-                        recordFlag == 1 and (self.getTime() - lastGPIOtime) > self.T1
-                    ) or (
-                        recordFlag == 2 and (self.getTime() - lastGPIOtime) > self.T2
-                    ):
+                    # close the clip: line held high for T1, no event for T2, or
+                    # clip as long as maxClip (save before its start leaves the buffer)
+                    now = self.getTime()
+                    vidStopTime = None
+                    if recordFlag == 1 and now - lastGPIOtime > self.T1:
+                        vidStopTime = lastGPIO[1] + self.T1 * 1e6
+                    elif recordFlag == 2 and now - lastGPIOtime > self.T2:
+                        vidStopTime = lastGPIO[1] + self.postBuffer * 1e6
+                    elif recordFlag and now - startTime > self.maxClip:
+                        vidStopTime = time.time() * 1e6
+
+                    if vidStopTime is not None:
 
                         with open(self.timeFileName, "a") as timeFile:
                             timeFile.write(eventLog)
                         vidStartTime = camStartTime - self.vidBuffer * 1e6
-                        if recordFlag == 1:
-                            vidStopTime = lastGPIO[1] + self.T1 * 1e6
-                        elif recordFlag == 2:
-                            vidStopTime = lastGPIO[1] + self.T2 * 1e6
 
                         duration = round((vidStopTime - vidStartTime) / 1e6)
 
-                        self._circular_output.fileoutput = self.videoFileName
-                        self._circular_output.start()
-                        time.sleep(0.1)
-                        self._circular_output.stop()
-                        # Write timestamps file
-                        try:
-                            with open(self.framesFileName, "w") as tfile:
-                                tfile.write("%d\n" % int(vidStartTime))
-                                tfile.write("0\n")
-                        except Exception as e:
-                            logging.warning("Failed to write frames file: %s", e)
+                        self.bufferOutput.copy_to(
+                            self.videoFileName,
+                            self.framesFileName,
+                            vidStartTime,
+                            vidStopTime,
+                        )
                         logging.debug(
                             "%s: Saved %s (%d seconds)\n"
                             % (
@@ -1601,8 +1619,10 @@ if __name__ == "__main__":
             cam1.setBuffer(
                 preEventSaveTime=2,
                 initialWaitTime=10,
-                inactivityTime=2,
+                inactivityTime=5,
+                postEventSaveTime=2,
                 circularBufferSize=60,
+                maxClipTime=50,
             )
         cam1.recordSchedule()
         cam1.setStorage(video_dir)
