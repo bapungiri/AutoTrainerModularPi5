@@ -3,6 +3,7 @@ RPi_IP              = 10.36.22.227
 Experiment_Name     = Nosepoke2port
 Box_Name            = C01
 Subject_Name        = Kompany
+# Seed_Stage        = <Subject_Name>:<stage>   # one-time start stage for an animal without state.json yet (e.g. moved from another box); stage 0 = first
 Daily_Water         = 2000
 Water_Minimum       = 75%
 TimeSyncFreq        = 1HR
